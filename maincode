@@ -1,0 +1,472 @@
+import os
+import sys
+import inspect
+import threading
+import tkinter as tk
+from tkinter import ttk
+
+import cv2
+import numpy as np
+import pyrealsense2 as rs
+import torch
+from PIL import Image
+from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
+
+# =========================
+# SAM2 path setup
+# =========================
+SAM2_BASE_PATH = "/home/kimjimin/sam2"
+sys.path.append(SAM2_BASE_PATH)
+
+from sam2.build_sam import build_sam2
+from sam2.sam2_image_predictor import SAM2ImagePredictor
+from hydra import initialize_config_dir
+from hydra.core.global_hydra import GlobalHydra
+
+CONFIG_DIR = os.path.join(SAM2_BASE_PATH, "sam2/configs/sam2.1")
+CKPT_PATH = os.path.join(SAM2_BASE_PATH, "checkpoints/sam2.1_hiera_tiny.pt")
+
+# =========================
+# Settings
+# =========================
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+WINDOW_NAME = "RealSense Click Recognition"
+
+GDINO_MODEL_ID = "IDEA-Research/grounding-dino-tiny"
+BOX_THRESHOLD = 0.25
+TEXT_THRESHOLD = 0.20
+
+
+class ClickGroundingSAM2App:
+    def __init__(self):
+        self.running = True
+        self.video_thread = None
+
+        self.current_prompt = "cup . bottle . mouse . keyboard ."
+        self.last_label = ""
+        self.last_score = 0.0
+
+        self.clicked_point = None
+        self.last_box = None
+        self.last_mask = None
+
+        self.frame_lock = threading.Lock()
+        self.current_bgr = None
+
+        # -------------------------
+        # Tkinter UI
+        # -------------------------
+        self.root = tk.Tk()
+        self.root.title("Prompt Input UI")
+        self.root.geometry("520x220")
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        ttk.Label(
+            self.root,
+            text="Enter Candidate Object Prompts",
+            font=("Arial", 14, "bold")
+        ).pack(pady=(15, 8))
+
+        self.entry = ttk.Entry(self.root, width=58, font=("Arial", 11))
+        self.entry.pack(pady=5)
+        self.entry.insert(0, self.current_prompt)
+
+        ttk.Label(
+            self.root,
+            text="Example: cup . bottle . mouse . keyboard .",
+            font=("Arial", 10)
+        ).pack(pady=2)
+
+        button_frame = ttk.Frame(self.root)
+        button_frame.pack(pady=10)
+
+        ttk.Button(button_frame, text="Apply", command=self.apply_prompt).grid(row=0, column=0, padx=5)
+        ttk.Button(button_frame, text="Clear", command=self.clear_prompt).grid(row=0, column=1, padx=5)
+        ttk.Button(button_frame, text="Exit", command=self.on_close).grid(row=0, column=2, padx=5)
+
+        self.status_label = ttk.Label(
+            self.root,
+            text=f"Current Prompt: {self.current_prompt}",
+            font=("Arial", 10)
+        )
+        self.status_label.pack(pady=8)
+
+        self.result_label = ttk.Label(
+            self.root,
+            text="Click Result: None",
+            font=("Arial", 10, "bold")
+        )
+        self.result_label.pack(pady=4)
+
+        # -------------------------
+        # RealSense setup
+        # -------------------------
+        self.pipeline = rs.pipeline()
+        self.config = rs.config()
+        self.config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+
+        # -------------------------
+        # GroundingDINO load
+        # -------------------------
+        print("Loading GroundingDINO...")
+        self.gdino_processor = AutoProcessor.from_pretrained(GDINO_MODEL_ID)
+        self.gdino_model = AutoModelForZeroShotObjectDetection.from_pretrained(GDINO_MODEL_ID).to(DEVICE)
+        self.gdino_model.eval()
+        print("GroundingDINO loaded successfully")
+
+        # -------------------------
+        # SAM2 load
+        # -------------------------
+        print("Loading SAM2 model...")
+        if GlobalHydra.instance().is_initialized():
+            GlobalHydra.instance().clear()
+
+        with initialize_config_dir(CONFIG_DIR, version_base="1.2"):
+            sam2_model = build_sam2(
+                "sam2.1_hiera_t.yaml",
+                CKPT_PATH,
+                device=DEVICE
+            )
+
+        self.sam2_predictor = SAM2ImagePredictor(sam2_model)
+        print("SAM2 loaded successfully")
+
+    # -------------------------
+    # UI callbacks
+    # -------------------------
+    def apply_prompt(self):
+        text = self.entry.get().strip()
+        self.current_prompt = text
+        shown = self.current_prompt if self.current_prompt else "(None)"
+        self.status_label.config(text=f"Current Prompt: {shown}")
+
+    def clear_prompt(self):
+        self.entry.delete(0, tk.END)
+        self.current_prompt = ""
+        self.status_label.config(text="Current Prompt: (None)")
+
+    def on_close(self):
+        self.running = False
+        try:
+            self.root.after(0, self.root.quit)
+        except Exception:
+            pass
+
+    # -------------------------
+    # OpenCV mouse callback
+    # -------------------------
+    def on_mouse(self, event, x, y, flags, param):
+        if event != cv2.EVENT_LBUTTONDOWN:
+            return
+
+        if self.current_prompt.strip() == "":
+            print("Prompt is empty.")
+            self.result_label.config(text="Click Result: Prompt is empty")
+            return
+
+        with self.frame_lock:
+            if self.current_bgr is None:
+                return
+            image = self.current_bgr.copy()
+
+        self.clicked_point = (x, y)
+        print(f"Clicked position: {self.clicked_point}")
+
+        try:
+            self.run_click_recognition(image, self.clicked_point)
+        except Exception as e:
+            self.last_box = None
+            self.last_mask = None
+            self.last_label = "error"
+            self.last_score = 0.0
+            self.result_label.config(text=f"Click Result: Error - {type(e).__name__}")
+            print("Click recognition error:", repr(e))
+
+    # -------------------------
+    # GroundingDINO postprocess compatibility
+    # -------------------------
+    def postprocess_gdino_results(self, outputs, inputs, image_shape_hw):
+        """
+        The signature of post_process_grounded_object_detection may differ
+        across transformers versions, so try several call styles in order.
+        """
+        target_sizes_tensor = torch.tensor([image_shape_hw], device=DEVICE)
+        target_sizes_list = [list(image_shape_hw)]
+
+        fn = self.gdino_processor.post_process_grounded_object_detection
+        sig = inspect.signature(fn)
+        param_names = list(sig.parameters.keys())
+
+        # 1) Newer/documented kwargs style
+        try:
+            kwargs = {}
+            if "outputs" in param_names:
+                kwargs["outputs"] = outputs
+            if "input_ids" in param_names:
+                kwargs["input_ids"] = inputs["input_ids"]
+            if "threshold" in param_names:
+                kwargs["threshold"] = BOX_THRESHOLD
+            if "text_threshold" in param_names:
+                kwargs["text_threshold"] = TEXT_THRESHOLD
+            if "target_sizes" in param_names:
+                kwargs["target_sizes"] = target_sizes_tensor
+
+            if kwargs:
+                return fn(**kwargs)
+        except Exception:
+            pass
+
+        # 2) Older positional + kwargs style
+        try:
+            return fn(
+                outputs,
+                inputs["input_ids"],
+                threshold=BOX_THRESHOLD,
+                text_threshold=TEXT_THRESHOLD,
+                target_sizes=target_sizes_tensor,
+            )
+        except Exception:
+            pass
+
+        # 3) Model card style
+        try:
+            return fn(
+                outputs,
+                inputs["input_ids"],
+                box_threshold=BOX_THRESHOLD,
+                text_threshold=TEXT_THRESHOLD,
+                target_sizes=target_sizes_list,
+            )
+        except Exception:
+            pass
+
+        # 4) Options-dict style
+        try:
+            return fn(
+                outputs,
+                inputs["input_ids"],
+                {
+                    "box_threshold": BOX_THRESHOLD,
+                    "text_threshold": TEXT_THRESHOLD,
+                    "target_sizes": target_sizes_list,
+                },
+            )
+        except Exception:
+            pass
+
+        # 5) Final attempt
+        try:
+            return fn(
+                outputs,
+                inputs["input_ids"],
+                threshold=BOX_THRESHOLD,
+                text_threshold=TEXT_THRESHOLD,
+                target_sizes=target_sizes_list,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                "GroundingDINO post_process_grounded_object_detection call style "
+                "does not match the currently installed transformers version."
+            ) from e
+
+    # -------------------------
+    # GroundingDINO + SAM2
+    # -------------------------
+    def run_click_recognition(self, image_bgr, clicked_point):
+        x_click, y_click = clicked_point
+        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+
+        text_prompt = self.current_prompt.strip().lower()
+        if not text_prompt.endswith("."):
+            text_prompt += "."
+
+        pil_image = Image.fromarray(image_rgb)
+
+        inputs = self.gdino_processor(
+            images=pil_image,
+            text=text_prompt,
+            return_tensors="pt"
+        )
+        inputs = {k: v.to(DEVICE) if hasattr(v, "to") else v for k, v in inputs.items()}
+
+        with torch.inference_mode():
+            outputs = self.gdino_model(**inputs)
+
+        results = self.postprocess_gdino_results(outputs, inputs, pil_image.size[::-1])
+
+        result = results[0]
+        boxes = result["boxes"]
+        scores = result["scores"]
+        labels = result.get("labels", [])
+
+        if hasattr(boxes, "detach"):
+            boxes = boxes.detach().cpu().numpy()
+        else:
+            boxes = np.asarray(boxes, dtype=np.float32)
+
+        if hasattr(scores, "detach"):
+            scores = scores.detach().cpu().numpy()
+        else:
+            scores = np.asarray(scores, dtype=np.float32)
+
+        if len(boxes) == 0:
+            self.last_box = None
+            self.last_mask = None
+            self.last_label = "no detection"
+            self.last_score = 0.0
+            self.result_label.config(text="Click Result: No detection")
+            print("No detection")
+            return
+
+        candidate_indices = []
+        for i, box in enumerate(boxes):
+            x1, y1, x2, y2 = box
+            if x1 <= x_click <= x2 and y1 <= y_click <= y2:
+                candidate_indices.append(i)
+
+        if len(candidate_indices) == 0:
+            self.last_box = None
+            self.last_mask = None
+            self.last_label = "no box contains click"
+            self.last_score = 0.0
+            self.result_label.config(text="Click Result: No box contains the clicked point")
+            print("No box contains the clicked point")
+            return
+
+        best_idx = max(candidate_indices, key=lambda i: float(scores[i]))
+        best_box = boxes[best_idx].astype(np.float32)
+        best_score = float(scores[best_idx])
+        best_label = labels[best_idx] if best_idx < len(labels) else "unknown"
+
+        self.sam2_predictor.set_image(image_rgb)
+
+        if DEVICE == "cuda":
+            with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                masks, _, _ = self.sam2_predictor.predict(
+                    box=best_box,
+                    multimask_output=False
+                )
+        else:
+            with torch.inference_mode():
+                masks, _, _ = self.sam2_predictor.predict(
+                    box=best_box,
+                    multimask_output=False
+                )
+
+        best_mask = masks[0] > 0
+
+        self.last_box = best_box
+        self.last_mask = best_mask
+        self.last_label = str(best_label)
+        self.last_score = best_score
+
+        self.result_label.config(
+            text=f"Click Result: {self.last_label} ({self.last_score:.2f})"
+        )
+        print(f"Detection Result: {self.last_label} ({self.last_score:.2f})")
+
+    # -------------------------
+    # Visualization
+    # -------------------------
+    def draw_overlay(self, image_bgr):
+        vis = image_bgr.copy()
+
+        prompt_text = self.current_prompt if self.current_prompt else "(No Prompt)"
+        cv2.putText(
+            vis,
+            f"Prompt: {prompt_text}",
+            (12, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.62,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA
+        )
+        cv2.putText(
+            vis,
+            "Left click: detect clicked object | q: quit",
+            (12, 54),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.58,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA
+        )
+
+        if self.clicked_point is not None:
+            cv2.circle(vis, self.clicked_point, 5, (0, 0, 255), -1)
+
+        if self.last_mask is not None:
+            color_mask = np.zeros_like(vis)
+            color_mask[self.last_mask] = (0, 255, 0)
+            vis = cv2.addWeighted(vis, 1.0, color_mask, 0.35, 0)
+
+        if self.last_box is not None:
+            x1, y1, x2, y2 = self.last_box.astype(int)
+            cv2.rectangle(vis, (x1, y1), (x2, y2), (255, 200, 0), 2)
+
+            label_text = f"{self.last_label}: {self.last_score:.2f}"
+            cv2.putText(
+                vis,
+                label_text,
+                (x1, max(20, y1 - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 255),
+                2,
+                cv2.LINE_AA
+            )
+
+        return vis
+
+    # -------------------------
+    # Video loop
+    # -------------------------
+    def video_loop(self):
+        cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(WINDOW_NAME, 960, 720)
+        cv2.setMouseCallback(WINDOW_NAME, self.on_mouse)
+
+        try:
+            self.pipeline.start(self.config)
+            print("RealSense started")
+
+            while self.running:
+                frames = self.pipeline.wait_for_frames()
+                color_frame = frames.get_color_frame()
+                if not color_frame:
+                    continue
+
+                image = np.asanyarray(color_frame.get_data())
+
+                with self.frame_lock:
+                    self.current_bgr = image.copy()
+
+                vis = self.draw_overlay(image)
+                cv2.imshow(WINDOW_NAME, vis)
+
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
+                    self.running = False
+                    try:
+                        self.root.after(0, self.root.quit)
+                    except Exception:
+                        pass
+                    break
+
+        finally:
+            try:
+                self.pipeline.stop()
+            except Exception:
+                pass
+            cv2.destroyAllWindows()
+
+    def run(self):
+        self.video_thread = threading.Thread(target=self.video_loop, daemon=True)
+        self.video_thread.start()
+        self.root.mainloop()
+
+
+if __name__ == "__main__":
+    app = ClickGroundingSAM2App()
+    app.run()
