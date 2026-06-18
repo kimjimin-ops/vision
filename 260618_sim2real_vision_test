@@ -1,0 +1,128 @@
+import numpy as np
+import cv2
+import pyrealsense2 as rs
+
+# =========================
+# 좌표 변환 오프셋 (단위: m)
+#   - 최종 x 좌표에 항상 X_OFFSET을 더함
+#   - 최종 y 좌표에 항상 Y_OFFSET을 더함
+# =========================
+X_OFFSET = 0.94
+Y_OFFSET = 0.27
+
+# =========================
+# 빨간색 HSV 임계값
+#   red는 hue가 0/180 양쪽으로 갈라지므로 두 구간을 합침.
+#   조명에 따라 S(채도)/V(명도) 하한을 조절하세요.
+# =========================
+LOWER_RED1 = np.array([0,   120,  70])
+UPPER_RED1 = np.array([10,  255, 255])
+LOWER_RED2 = np.array([170, 120,  70])
+UPPER_RED2 = np.array([180, 255, 255])
+
+MIN_AREA  = 300   # 이보다 작은 빨강 블롭은 노이즈로 무시 (픽셀 면적)
+DEPTH_WIN = 2     # 중심 픽셀 주변 (2*win+1)^2 윈도우에서 depth median
+
+
+# =========================
+# RealSense 초기화
+# =========================
+pipeline = rs.pipeline()
+config = rs.config()
+config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+
+profile = pipeline.start(config)
+align = rs.align(rs.stream.color)
+
+# depth를 color에 정렬(align)했으므로 deproject는 'color' intrinsics를 사용해야 함.
+intr = profile.get_stream(rs.stream.color) \
+              .as_video_stream_profile() \
+              .get_intrinsics()
+
+
+def median_depth(depth_frame, u, v, w, h, win=DEPTH_WIN):
+    """중심 픽셀 주변 윈도우에서 0이 아닌 depth들의 median(m). 없으면 0.
+       단일 픽셀 depth가 튀거나 0으로 빠지는 것을 완화."""
+    vals = []
+    for dy in range(-win, win + 1):
+        for dx in range(-win, win + 1):
+            x, y = u + dx, v + dy
+            if 0 <= x < w and 0 <= y < h:
+                z = depth_frame.get_distance(x, y)
+                if z > 0:
+                    vals.append(z)
+    return float(np.median(vals)) if vals else 0.0
+
+
+try:
+    while True:
+        frames = align.process(pipeline.wait_for_frames())
+        c = frames.get_color_frame()
+        d = frames.get_depth_frame()
+        if not c or not d:
+            continue
+
+        img = np.asanyarray(c.get_data())
+        h, w = img.shape[:2]
+        vis = img.copy()
+
+        # ===== 빨간색 마스크 =====
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, LOWER_RED1, UPPER_RED1) | \
+               cv2.inRange(hsv, LOWER_RED2, UPPER_RED2)
+
+        kernel = np.ones((5, 5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel)  # 노이즈 제거
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)  # 구멍 메움
+
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+
+        coord_txt = "red: not found"
+
+        if cnts:
+            cnt = max(cnts, key=cv2.contourArea)
+            if cv2.contourArea(cnt) >= MIN_AREA:
+                # ----- 빨간 물체의 중심 픽셀 (무게중심) -----
+                M = cv2.moments(cnt)
+                if M["m00"] > 0:
+                    u = int(M["m10"] / M["m00"])
+                    v = int(M["m01"] / M["m00"])
+
+                    cv2.drawContours(vis, [cnt], -1, (0, 255, 0), 2)
+                    cv2.circle(vis, (u, v), 4, (0, 0, 255), -1)
+
+                    # ----- depth → 카메라 3D 좌표 (단위: m) -----
+                    z = median_depth(d, u, v, w, h)
+                    if z > 0:
+                        X, Y, Z = rs.rs2_deproject_pixel_to_point(intr, [u, v], z)
+                        # 카메라 좌표계: X=화면 오른쪽(+), Y=화면 아래(+), Z=전방(+)
+
+                        # ----- 사용자 좌표계로 매핑 -----
+                        #   원점 = 화면(광학) 중심
+                        #   +y = 좌 -> 우  = +X_cam
+                        #   +x = 아래      = +Y_cam
+                        x_user = Y + X_OFFSET
+                        y_user = X + Y_OFFSET
+
+                        coord_txt = f"x={x_user:+.3f}  y={y_user:+.3f} (m)"
+                        print(f"[RED] pixel=({u},{v})  "
+                              f"x={x_user:+.4f}  y={y_user:+.4f}  "
+                              f"(depth Z={Z:.3f}m)")
+                    else:
+                        coord_txt = "red found, depth=0"
+
+        # 화면 중심(원점) 십자 + 좌표 텍스트
+        cv2.drawMarker(vis, (w // 2, h // 2), (255, 255, 0),
+                       cv2.MARKER_CROSS, 14, 1)
+        cv2.putText(vis, coord_txt, (10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+        cv2.imshow("red center (m)", vis)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+finally:
+    pipeline.stop()
+    cv2.destroyAllWindows()
