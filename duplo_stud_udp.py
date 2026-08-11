@@ -557,6 +557,75 @@ class Detector:
 # 7. 좌표 변환 / 송신
 # ════════════════════════════════════════════════════════════════════
 
+def _profiles(dev, stream):
+    """장치가 실제로 지원하는 (w, h, fps, format) 목록."""
+    out = []
+    for s in dev.sensors:
+        for p in s.get_stream_profiles():
+            if p.stream_type() != stream:
+                continue
+            v = p.as_video_stream_profile()
+            out.append((v.width(), v.height(), p.fps(), p.format()))
+    return out
+
+
+def _pick(profs, formats, want_w, want_h, want_fps, min_fps=15):
+    """요청 조합 → 없으면 가장 가까운 지원 조합으로 폴백.
+
+    'Couldn't resolve requests' 는 요청 조합이 지원 목록에 없을 때 납니다.
+    USB2 연결, 펌웨어별 포맷 차이 등으로 흔히 발생하므로 하드코딩 대신
+    실제 지원 목록에서 고릅니다.
+    """
+    cand = [p for p in profs if p[3] in formats]
+    if not cand:
+        return None
+    exact = [p for p in cand
+             if p[0] == want_w and p[1] == want_h and p[2] == want_fps]
+    if exact:
+        return exact[0]
+    same_res = [p for p in cand
+                if p[0] == want_w and p[1] == want_h and p[2] >= min_fps]
+    if same_res:
+        return min(same_res, key=lambda p: abs(p[2] - want_fps))
+    # 해상도 폴백: 요청 이하 중 가장 큰 것 (없으면 전체 중 가장 큰 것)
+    usable = [p for p in cand if p[2] >= min_fps] or cand
+    below = [p for p in usable if p[0] * p[1] <= want_w * want_h]
+    pool = below or usable
+    return max(pool, key=lambda p: (p[0] * p[1], p[2]))
+
+
+def configure_streams(cfg, dev):
+    """컬러/뎁스 스트림을 지원 목록에 맞춰 설정. 선택 결과를 반환."""
+    try:
+        usb = dev.get_info(rs.camera_info.usb_type_descriptor)
+    except Exception:
+        usb = "?"
+    if str(usb).startswith("2"):
+        print(f"⚠️  USB {usb} 로 연결됨 — 대역폭 부족으로 고해상도가 막힙니다.")
+        print("    USB3 케이블/포트로 바꾸면 정밀도가 크게 올라갑니다.")
+
+    c = _pick(_profiles(dev, rs.stream.color),
+              (rs.format.bgr8, rs.format.rgb8),
+              COLOR_W, COLOR_H, COLOR_FPS)
+    d = _pick(_profiles(dev, rs.stream.depth), (rs.format.z16,),
+              DEPTH_W, DEPTH_H, DEPTH_FPS)
+    if c is None or d is None:
+        raise RuntimeError("컬러/뎁스 지원 프로파일을 찾지 못했습니다. "
+                           "rs_probe.py 로 확인하세요.")
+
+    # fps 는 두 스트림을 맞춰야 동기화가 안정적
+    fps = min(c[2], d[2])
+    cfg.enable_stream(rs.stream.color, c[0], c[1], c[3], fps)
+    cfg.enable_stream(rs.stream.depth, d[0], d[1], d[3], fps)
+
+    if (c[0], c[1]) != (COLOR_W, COLOR_H):
+        print(f"ℹ️  컬러 {COLOR_W}x{COLOR_H} 미지원 → {c[0]}x{c[1]} 로 대체")
+    if (d[0], d[1]) != (DEPTH_W, DEPTH_H):
+        print(f"ℹ️  뎁스 {DEPTH_W}x{DEPTH_H} 미지원 → {d[0]}x{d[1]} 로 대체")
+    print(f"🎬 color {c[0]}x{c[1]} {c[3]} | depth {d[0]}x{d[1]} | {fps}fps")
+    return c, d, fps
+
+
 def load_handeye(path):
     try:
         T = np.load(path)
@@ -683,13 +752,27 @@ def main():
     det = Detector()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
+    ctx = rs.context()
+    devs = list(ctx.query_devices())
+    if not devs:
+        raise SystemExit("❌ RealSense 장치를 찾지 못했습니다. "
+                         "USB 연결과 udev 권한을 확인하세요.")
+    dev = devs[0]
+    print(f"📷 {dev.get_info(rs.camera_info.name)}  "
+          f"FW {dev.get_info(rs.camera_info.firmware_version)}")
+
     pipeline = rs.pipeline()
     cfg = rs.config()
-    cfg.enable_stream(rs.stream.color, COLOR_W, COLOR_H,
-                      rs.format.bgr8, COLOR_FPS)
-    cfg.enable_stream(rs.stream.depth, DEPTH_W, DEPTH_H,
-                      rs.format.z16, DEPTH_FPS)
-    profile = pipeline.start(cfg)
+    cfg.enable_device(dev.get_info(rs.camera_info.serial_number))
+    configure_streams(cfg, dev)
+    try:
+        profile = pipeline.start(cfg)
+    except RuntimeError as e:
+        print(f"❌ pipeline.start 실패: {e}")
+        print("   rs_probe.py 를 실행해 실제 지원 조합을 확인하세요.")
+        print("   다른 프로그램(realsense-viewer 등)이 카메라를 "
+              "점유 중인지도 확인하세요.")
+        raise
 
     # High Accuracy 프리셋 — 근접 정밀 작업에 유리
     try:
