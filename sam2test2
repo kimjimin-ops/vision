@@ -1,0 +1,193 @@
+import sys, os, time
+import numpy as np
+import cv2
+import torch
+import pyrealsense2 as rs
+
+# =========================
+# 기준점 (pixel)
+# =========================
+REF_X, REF_Y = 130, 115
+INNER_MARGIN_MM = 40.0
+
+# =========================
+# Rect 안정화 파라미터
+# =========================
+EMA_ALPHA = 0.25
+MAX_CENTER_SHIFT = 3
+MAX_SIZE_SHIFT = 6
+MAX_ANGLE_SHIFT = 2.0
+
+prev_rect = None
+
+# =========================
+# SAM2 설정
+# =========================
+SAM2_BASE_PATH = "/home/kimjimin/sam2"
+sys.path.append(SAM2_BASE_PATH)
+
+from sam2.build_sam import build_sam2
+from sam2.sam2_image_predictor import SAM2ImagePredictor
+from hydra import initialize_config_dir
+from hydra.core.global_hydra import GlobalHydra
+
+CONFIG_DIR = os.path.join(SAM2_BASE_PATH, "sam2/configs/sam2.1")
+CKPT_PATH = os.path.join(SAM2_BASE_PATH, "checkpoints/sam2.1_hiera_tiny.pt")
+
+if GlobalHydra.instance().is_initialized():
+    GlobalHydra.instance().clear()
+
+with initialize_config_dir(CONFIG_DIR, version_base="1.2"):
+    sam2 = build_sam2("sam2.1_hiera_t.yaml", CKPT_PATH, device="cuda")
+
+predictor = SAM2ImagePredictor(sam2)
+
+# =========================
+# RealSense
+# =========================
+pipeline = rs.pipeline()
+config = rs.config()
+config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+
+profile = pipeline.start(config)
+align = rs.align(rs.stream.color)
+
+intr = profile.get_stream(rs.stream.depth) \
+              .as_video_stream_profile() \
+              .get_intrinsics()
+
+# =========================
+def dist3d(a, b):
+    return np.linalg.norm(a - b)
+
+def rect_similar(r1, r2):
+    (c1,s1,a1),(c2,s2,a2) = r1, r2
+    return (
+        abs(c1[0]-c2[0]) < MAX_CENTER_SHIFT and
+        abs(c1[1]-c2[1]) < MAX_CENTER_SHIFT and
+        abs(s1[0]-s2[0]) < MAX_SIZE_SHIFT and
+        abs(s1[1]-s2[1]) < MAX_SIZE_SHIFT and
+        abs(a1-a2) < MAX_ANGLE_SHIFT
+    )
+
+# =========================
+try:
+    while True:
+        frames = align.process(pipeline.wait_for_frames())
+        c = frames.get_color_frame()
+        d = frames.get_depth_frame()
+        if not c or not d:
+            continue
+
+        img = np.asanyarray(c.get_data())
+        h, w = img.shape[:2]
+
+        # 중앙 포인트 프롬프트
+        point = np.array([[w//2, h//2]])
+        label = np.array([1])
+
+        with torch.inference_mode():
+            predictor.set_image(img)
+            masks, _, _ = predictor.predict(
+                point_coords=point,
+                point_labels=label,
+                multimask_output=False
+            )
+
+        mask = masks[0].astype(np.uint8) * 255
+
+        # ===== mask 안정화 (morphology) =====
+        kernel = np.ones((5,5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+        # 시각화
+        overlay = img.copy()
+        overlay[mask > 0] = (0, 255, 0)
+        vis = cv2.addWeighted(img, 0.6, overlay, 0.4, 0)
+
+        # 컨투어 → 최소 외접 사각형
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+
+        if cnts:
+            cnt = max(cnts, key=cv2.contourArea)
+            rect = cv2.minAreaRect(cnt)
+
+            # ===== rect 안정화 =====
+            if prev_rect is None:
+                smooth_rect = rect
+            else:
+                if rect_similar(rect, prev_rect):
+                    smooth_rect = prev_rect
+                else:
+                    (cx,cy),(pw,ph),ang = rect
+                    (pcx,pcy),(ppw,pph),pang = prev_rect
+
+                    scx = pcx*(1-EMA_ALPHA) + cx*EMA_ALPHA
+                    scy = pcy*(1-EMA_ALPHA) + cy*EMA_ALPHA
+                    spw = ppw*(1-EMA_ALPHA) + pw*EMA_ALPHA
+                    sph = pph*(1-EMA_ALPHA) + ph*EMA_ALPHA
+                    sang = pang*(1-EMA_ALPHA) + ang*EMA_ALPHA
+
+                    smooth_rect = ((scx,scy),(spw,sph),sang)
+
+            prev_rect = smooth_rect
+
+            box = cv2.boxPoints(smooth_rect).astype(int)
+            cv2.drawContours(vis, [box], 0, (0,255,0), 1)
+
+            # ===== 3D 박스 크기 =====
+            pts3d = []
+            for x,y in box:
+                z = d.get_distance(x,y)
+                if z == 0:
+                    pts3d = []
+                    break
+                X,Y,Z = rs.rs2_deproject_pixel_to_point(
+                    intr, [x,y], z)
+                pts3d.append(np.array([X,Y,Z])*1000)
+
+            if len(pts3d)==4:
+                pts3d = np.array(pts3d)
+                width = (dist3d(pts3d[0], pts3d[1]) +
+                         dist3d(pts3d[2], pts3d[3])) / 2
+                height = (dist3d(pts3d[1], pts3d[2]) +
+                          dist3d(pts3d[3], pts3d[0])) / 2
+
+                sw = (width - INNER_MARGIN_MM) / width
+                sh = (height - INNER_MARGIN_MM) / height
+
+                (cx,cy),(pw,ph),ang = smooth_rect
+                inner = ((cx,cy),(pw*sw,ph*sh),ang)
+                inner_box = cv2.boxPoints(inner).astype(int)
+
+                cv2.drawContours(vis, [inner_box], 0, (0,0,255), 1)
+
+                # ===== 기준점 3D =====
+                dz = d.get_distance(REF_X, REF_Y)
+                if dz > 0:
+                    Xr,Yr,Zr = rs.rs2_deproject_pixel_to_point(
+                        intr,[REF_X,REF_Y],dz)
+                    ref = np.array([Xr,Yr,Zr])*1000
+
+                    print("\n[Inner box mm (ref 기준)]")
+                    for i,(x,y) in enumerate(inner_box):
+                        z = d.get_distance(x,y)
+                        if z == 0: continue
+                        X,Y,Z = rs.rs2_deproject_pixel_to_point(
+                            intr,[x,y],z)
+                        P = np.array([X,Y,Z])*1000
+                        diff = P - ref
+                        print(f"P{i+1}: ΔX={diff[0]:+.2f}  ΔY={diff[1]:+.2f}")
+
+        cv2.circle(vis,(REF_X,REF_Y),1,(0,0,255),-1)
+        cv2.imshow("SAM2 + mm (stabilized)", vis)
+
+        if cv2.waitKey(1)&0xFF==ord('q'):
+            break
+
+finally:
+    pipeline.stop()
+    cv2.destroyAllWindows()
